@@ -35,10 +35,9 @@ cmake_install.cmake
 Makefile
 
 # --- Binaries & Libraries ---
-# Comment these when shared libraries are usable
-# bindings/*.dll
-# bindings/*.so
-# bindings/*.dylib
+bindings/*.dll
+bindings/*.so
+bindings/*.dylib
 
 # --- Testing ---
 test_detail.xml
