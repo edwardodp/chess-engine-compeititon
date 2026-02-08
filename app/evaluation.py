@@ -198,6 +198,253 @@ def init_tables():
 # Pre-compute tables
 MG_TABLE, EG_TABLE = init_tables()
 
+# Pawn structure bonuses/penalties (tuned values)
+PASSED_PAWN_BONUS = np.array([0, 5, 10, 20, 35, 60, 100, 0], dtype=np.int32)  # by rank
+ISOLATED_PAWN_PENALTY = np.int32(-10)
+DOUBLED_PAWN_PENALTY = np.int32(-8)
+BACKWARD_PAWN_PENALTY = np.int32(-8)
+PAWN_CHAIN_BONUS = np.int32(5)
+CONNECTED_PAWN_BONUS = np.int32(5)
+
+
+# File masks for pawn structure analysis (precomputed)
+FILE_MASKS = np.zeros(8, dtype=np.int64)
+for file_idx in range(8):
+    mask = np.int64(0)
+    for rank in range(8):
+        mask |= np.int64(1) << (rank * 8 + file_idx)
+    FILE_MASKS[file_idx] = mask
+
+# Adjacent file masks
+ADJACENT_FILE_MASKS = np.zeros(8, dtype=np.int64)
+for file_idx in range(8):
+    mask = np.int64(0)
+    if file_idx > 0:
+        mask |= FILE_MASKS[file_idx - 1]
+    if file_idx < 7:
+        mask |= FILE_MASKS[file_idx + 1]
+    ADJACENT_FILE_MASKS[file_idx] = mask
+
+
+@njit(int32(int64, int64, int32, int32))
+def evaluate_pawn_structure(white_pawns, black_pawns, color, game_phase):
+    """
+    Evaluate pawn structure for one side.
+    
+    Args:
+        white_pawns: Bitboard of white pawns
+        black_pawns: Bitboard of black pawns
+        color: 0 for white, 1 for black
+        game_phase: Current game phase (for scaling bonuses)
+    
+    Returns:
+        Score adjustment for pawn structure
+    """
+    score = np.int32(0)
+    
+    # Select pawns to evaluate
+    if color == WHITE:
+        our_pawns = white_pawns
+        their_pawns = black_pawns
+    else:
+        our_pawns = black_pawns
+        their_pawns = white_pawns
+    
+    # Count pawns per file for doubled pawn detection
+    file_counts = np.zeros(8, dtype=np.int32)
+    
+    # Temporary copy for iteration
+    pawns_copy = our_pawns
+    
+    while pawns_copy:
+        # Get LSB position
+        lsb = pawns_copy & -pawns_copy
+        sq = np.int32(0)
+        temp = lsb
+        while temp > 1:
+            temp >>= 1
+            sq += 1
+        
+        file = sq % 8
+        rank = sq // 8
+        
+        # Adjust rank for black (from black's perspective)
+        if color == BLACK:
+            rank = 7 - rank
+        
+        file_counts[file] += 1
+        
+        # Check for passed pawn
+        # A pawn is passed if no enemy pawns can stop it
+        is_passed = True
+        
+        # Check the file and adjacent files ahead
+        if color == WHITE:
+            # Check squares ahead for white
+            for check_rank in range(rank + 1, 8):
+                check_sq = check_rank * 8 + file
+                # Check this file
+                if (their_pawns >> check_sq) & 1:
+                    is_passed = False
+                    break
+                # Check adjacent files
+                if file > 0:
+                    check_sq_left = check_rank * 8 + (file - 1)
+                    if (their_pawns >> check_sq_left) & 1:
+                        is_passed = False
+                        break
+                if file < 7:
+                    check_sq_right = check_rank * 8 + (file + 1)
+                    if (their_pawns >> check_sq_right) & 1:
+                        is_passed = False
+                        break
+        else:
+            # Check squares ahead for black (going down in rank)
+            for check_rank in range(rank - 1, -1, -1):
+                check_sq = check_rank * 8 + file
+                # Check this file
+                if (their_pawns >> check_sq) & 1:
+                    is_passed = False
+                    break
+                # Check adjacent files
+                if file > 0:
+                    check_sq_left = check_rank * 8 + (file - 1)
+                    if (their_pawns >> check_sq_left) & 1:
+                        is_passed = False
+                        break
+                if file < 7:
+                    check_sq_right = check_rank * 8 + (file + 1)
+                    if (their_pawns >> check_sq_right) & 1:
+                        is_passed = False
+                        break
+        
+        if is_passed:
+            score += PASSED_PAWN_BONUS[rank]
+        
+        # Check for isolated pawn (no friendly pawns on adjacent files)
+        has_neighbor = False
+        if file > 0:
+            if our_pawns & FILE_MASKS[file - 1]:
+                has_neighbor = True
+        if file < 7:
+            if our_pawns & FILE_MASKS[file + 1]:
+                has_neighbor = True
+        
+        if not has_neighbor:
+            score += ISOLATED_PAWN_PENALTY
+        
+        # Check for pawn chain (supported by friendly pawn diagonally behind)
+        if color == WHITE:
+            # Check diagonally behind (rank - 1)
+            if rank > 0:
+                if file > 0:
+                    support_sq = (rank - 1) * 8 + (file - 1)
+                    if (our_pawns >> support_sq) & 1:
+                        score += PAWN_CHAIN_BONUS
+                elif file < 7:
+                    support_sq = (rank - 1) * 8 + (file + 1)
+                    if (our_pawns >> support_sq) & 1:
+                        score += PAWN_CHAIN_BONUS
+        else:
+            # Check diagonally behind for black (rank + 1)
+            if rank < 7:
+                if file > 0:
+                    support_sq = (rank + 1) * 8 + (file - 1)
+                    if (our_pawns >> support_sq) & 1:
+                        score += PAWN_CHAIN_BONUS
+                elif file < 7:
+                    support_sq = (rank + 1) * 8 + (file + 1)
+                    if (our_pawns >> support_sq) & 1:
+                        score += PAWN_CHAIN_BONUS
+        
+        # Check for connected pawns (side by side) - only check right to avoid double counting
+        if file < 7:
+            adjacent_sq = rank * 8 + (file + 1)
+            if (our_pawns >> adjacent_sq) & 1:
+                score += CONNECTED_PAWN_BONUS
+        
+        # Check for backward pawn
+        # A pawn is backward if it's behind all friendly pawns on adjacent files
+        # and cannot safely advance
+        is_backward = False
+        if has_neighbor:
+            # Check if this pawn is behind all neighbors
+            all_ahead = True
+            if file > 0:
+                left_pawns = our_pawns & FILE_MASKS[file - 1]
+                while left_pawns:
+                    lsb_left = left_pawns & -left_pawns
+                    sq_left = np.int32(0)
+                    temp_left = lsb_left
+                    while temp_left > 1:
+                        temp_left >>= 1
+                        sq_left += 1
+                    rank_left = sq_left // 8
+                    if color == BLACK:
+                        rank_left = 7 - rank_left
+                    if rank_left <= rank:
+                        all_ahead = False
+                        break
+                    left_pawns &= left_pawns - 1
+            
+            if file < 7 and all_ahead:
+                right_pawns = our_pawns & FILE_MASKS[file + 1]
+                while right_pawns:
+                    lsb_right = right_pawns & -right_pawns
+                    sq_right = np.int32(0)
+                    temp_right = lsb_right
+                    while temp_right > 1:
+                        temp_right >>= 1
+                        sq_right += 1
+                    rank_right = sq_right // 8
+                    if color == BLACK:
+                        rank_right = 7 - rank_right
+                    if rank_right <= rank:
+                        all_ahead = False
+                        break
+                    right_pawns &= right_pawns - 1
+            
+            if all_ahead:
+                # Check if advance square is attacked by enemy pawn
+                if color == WHITE:
+                    advance_sq = (rank + 1) * 8 + file
+                    if rank < 7:
+                        if file > 0:
+                            attacker_sq = (rank + 2) * 8 + (file - 1)
+                            if attacker_sq < 64 and ((their_pawns >> attacker_sq) & 1):
+                                is_backward = True
+                        if file < 7:
+                            attacker_sq = (rank + 2) * 8 + (file + 1)
+                            if attacker_sq < 64 and ((their_pawns >> attacker_sq) & 1):
+                                is_backward = True
+                else:
+                    advance_sq = (rank - 1) * 8 + file
+                    if rank > 0:
+                        if file > 0:
+                            attacker_sq = (rank - 2) * 8 + (file - 1)
+                            if attacker_sq >= 0 and ((their_pawns >> attacker_sq) & 1):
+                                is_backward = True
+                        if file < 7:
+                            attacker_sq = (rank - 2) * 8 + (file + 1)
+                            if attacker_sq >= 0 and ((their_pawns >> attacker_sq) & 1):
+                                is_backward = True
+                
+                if is_backward:
+                    score += BACKWARD_PAWN_PENALTY
+        
+        # Clear LSB
+        pawns_copy &= pawns_copy - 1
+    
+    # Check for doubled pawns
+    for file in range(8):
+        if file_counts[file] > 1:
+            # Penalty for each extra pawn on the file
+            score += DOUBLED_PAWN_PENALTY * (file_counts[file] - 1)
+    
+    return score
+
+
+
 
 
 @njit(int32(int64[:], int64[:], uint32))
@@ -212,13 +459,13 @@ def evaluation_function(board_pieces, board_occupancy, side_to_move):
         int32: The score from the perspective of the side to move
                (Positive = Current player (side to move) is winning)
     """
-    mg_white = 0
-    mg_black = 0
-    eg_white = 0
-    eg_black = 0
-    game_phase = 0
+    mg_white = np.int32(0)
+    mg_black = np.int32(0)
+    eg_white = np.int32(0)
+    eg_black = np.int32(0)
+    game_phase = np.int32(0)
     
-    score = 0
+    #score = 0
 
 
     def lsb_index(bb):
@@ -257,6 +504,22 @@ def evaluation_function(board_pieces, board_occupancy, side_to_move):
                 game_phase += GAMEPHASE_INC[piece_type]
                 # Clear the least significant bit
                 bitboard &= bitboard - 1 
+                
+                
+    # Evaluate pawn structure
+    white_pawns = board_pieces[PAWN]
+    black_pawns = board_pieces[PAWN + 6]
+    
+    pawn_score_white = evaluate_pawn_structure(white_pawns, black_pawns, WHITE, game_phase)
+    pawn_score_black = evaluate_pawn_structure(white_pawns, black_pawns, BLACK, game_phase)
+    
+    # Add pawn structure to both midgame and endgame scores
+    mg_white += (pawn_score_white * 6) // 10
+    mg_black += (pawn_score_black * 6) // 10
+    eg_white += pawn_score_white
+    eg_black += pawn_score_black            
+                
+                
     # Tapered eval
     #calculates the midgame and endgame score if the current turn is white
     if side_to_move == WHITE:
