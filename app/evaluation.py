@@ -442,9 +442,197 @@ def evaluate_pawn_structure(white_pawns, black_pawns, color, game_phase):
             score += DOUBLED_PAWN_PENALTY * (file_counts[file] - 1)
     
     return score
+# King safety bonuses/penalties (SIGNIFICANTLY REDUCED - was paralyzing the engine)
+PAWN_SHIELD_BONUS = np.int32(5)              # Was 10
+MISSING_PAWN_SHIELD_PENALTY = np.int32(-8)   # Was -15
+WEAK_PAWN_SHIELD_PENALTY = np.int32(-3)      # Was -10
+OPEN_FILE_NEAR_KING_PENALTY = np.int32(-12)  # Was -20
+SEMI_OPEN_FILE_NEAR_KING_PENALTY = np.int32(-5) # Was -10
+ENEMY_QUEEN_NEAR_KING_PENALTY = np.int32(-8)    # Was -15
+ENEMY_KNIGHT_NEAR_KING_PENALTY = np.int32(-5)   # Was -10
+ENEMY_BISHOP_NEAR_KING_PENALTY = np.int32(-3)   # Was -8
+OPEN_SQUARE_NEAR_KING_PENALTY = np.int32(-2)    # Was -5
+CASTLED_BONUS = np.int32(20)                     # Was 30
 
+# Piece attack weights for king safety
+QUEEN_ATTACK_WEIGHT = np.int32(4)
+ROOK_ATTACK_WEIGHT = np.int32(3)
+BISHOP_ATTACK_WEIGHT = np.int32(2)
+KNIGHT_ATTACK_WEIGHT = np.int32(2)
 
-
+@njit(int32(int64[:], int64[:], int32, int32))
+def evaluate_king_safety(board_pieces, board_occupancy, color, game_phase):
+    """
+    Evaluate king safety for one side.
+    Only applies significant penalties when ACTUALLY under threat.
+    """
+    score = np.int32(0)
+    
+    # Get king position
+    if color == WHITE:
+        king_bb = board_pieces[KING]
+        our_pawns = board_pieces[PAWN]
+        their_pawns = board_pieces[PAWN + 6]
+        their_knights = board_pieces[KNIGHT + 6]
+        their_bishops = board_pieces[BISHOP + 6]
+        their_rooks = board_pieces[ROOK + 6]
+        their_queens = board_pieces[QUEEN + 6]
+    else:
+        king_bb = board_pieces[KING + 6]
+        our_pawns = board_pieces[PAWN + 6]
+        their_pawns = board_pieces[PAWN]
+        their_knights = board_pieces[KNIGHT]
+        their_bishops = board_pieces[BISHOP]
+        their_rooks = board_pieces[ROOK]
+        their_queens = board_pieces[QUEEN]
+    
+    if their_queens == 0:
+        return 0
+    
+    # Find king square
+    if king_bb == 0:
+        return score
+    
+    king_sq = np.int32(0)
+    temp = king_bb
+    while temp > 1:
+        temp >>= 1
+        king_sq += 1
+    
+    king_file = king_sq % 8
+    king_rank = king_sq // 8
+    
+    # Adjust rank perspective for black
+    if color == BLACK:
+        king_rank = 7 - king_rank
+    
+    # 1. Pawn Shield - only care about immediate front
+    shield_count = np.int32(0)
+    
+    files_to_check = []
+    if king_file > 0:
+        files_to_check.append(king_file - 1)
+    files_to_check.append(king_file)
+    if king_file < 7:
+        files_to_check.append(king_file + 1)
+    
+    for file in files_to_check:
+        # Check pawn one square ahead
+        if color == WHITE:
+            if king_rank < 7:
+                shield_sq = (king_rank + 1) * 8 + file
+                if (our_pawns >> shield_sq) & 1:
+                    shield_count += 1
+        else:
+            if king_rank > 0:
+                shield_sq = (king_rank - 1) * 8 + file
+                if (our_pawns >> shield_sq) & 1:
+                    shield_count += 1
+    
+    # Reward having shield
+    score += shield_count * PAWN_SHIELD_BONUS
+    
+    # Only penalize missing shield if we're actually in danger
+    # Check if there are enemy attacking pieces nearby
+    enemy_pieces_nearby = False
+    
+    # Quick check for enemy queen or rooks
+    if their_queens != 0:
+        enemy_pieces_nearby = True
+    elif their_rooks != 0 and game_phase > 18:
+        enemy_pieces_nearby = True
+    
+    if enemy_pieces_nearby and shield_count < 2:
+        score += MISSING_PAWN_SHIELD_PENALTY
+    
+    # 2. Castling bonus - only if early/middlegame
+    if game_phase > 16:  # Only in opening/early middlegame
+        if color == WHITE and king_rank == 0:
+            if king_file >= 5 or king_file <= 2:
+                score += CASTLED_BONUS
+        elif color == BLACK and king_rank == 7:
+            if king_file >= 5 or king_file <= 2:
+                score += CASTLED_BONUS
+    
+    # 3. Open files - only penalize if enemy has heavy pieces
+    has_enemy_heavy = (their_rooks != 0) or (their_queens != 0)
+    
+    if has_enemy_heavy:
+        for file in files_to_check:
+            file_mask = FILE_MASKS[file]
+            has_our_pawn = (our_pawns & file_mask) != 0
+            has_their_pawn = (their_pawns & file_mask) != 0
+            
+            if not has_our_pawn and not has_their_pawn:
+                if (their_rooks | their_queens) & file_mask:
+                    score += OPEN_FILE_NEAR_KING_PENALTY
+            elif not has_our_pawn and has_their_pawn:
+                # Semi-open
+                if (their_rooks & file_mask) or (their_queens & file_mask):
+                    score += SEMI_OPEN_FILE_NEAR_KING_PENALTY
+    
+    # 4. Enemy piece proximity - count attackers
+    attack_weight = np.int32(0)
+    
+    # Check queen proximity (most dangerous)
+    if their_queens != 0:
+        queen_copy = their_queens
+        while queen_copy:
+            lsb = queen_copy & -queen_copy
+            sq = np.int32(0)
+            temp = lsb
+            while temp > 1:
+                temp >>= 1
+                sq += 1
+            
+            q_file = sq % 8
+            q_rank = sq // 8
+            
+            file_dist = abs(q_file - king_file)
+            rank_dist = abs(q_rank - king_rank)
+            
+            # Only count if very close
+            if file_dist <= 2 and rank_dist <= 2:
+                score += ENEMY_QUEEN_NEAR_KING_PENALTY
+                attack_weight += QUEEN_ATTACK_WEIGHT
+            
+            queen_copy &= queen_copy - 1
+    
+    # Check knight proximity
+    if their_knights != 0:
+        knight_copy = their_knights
+        while knight_copy:
+            lsb = knight_copy & -knight_copy
+            sq = np.int32(0)
+            temp = lsb
+            while temp > 1:
+                temp >>= 1
+                sq += 1
+            
+            n_file = sq % 8
+            n_rank = sq // 8
+            
+            file_dist = abs(n_file - king_file)
+            rank_dist = abs(n_rank - king_rank)
+            
+            # Knight is only dangerous if it can actually reach king zone
+            if (file_dist == 2 and rank_dist == 1) or (file_dist == 1 and rank_dist == 2) or (file_dist <= 1 and rank_dist <= 1):
+                score += ENEMY_KNIGHT_NEAR_KING_PENALTY
+                attack_weight += KNIGHT_ATTACK_WEIGHT
+            
+            knight_copy &= knight_copy - 1
+    
+    # 5. Multiple attackers penalty (REDUCED)
+    if attack_weight >= 7:
+        score -= (attack_weight - 6) * 3
+    
+    # Scale by game phase - king safety only matters in middlegame
+    if game_phase < 12:
+        return 0
+    elif game_phase < 20:
+        score = (score * (game_phase - 12)) // 8
+    
+    return score
 
 
 @njit(int32(int64[:], int64[:], uint32))
@@ -518,7 +706,20 @@ def evaluation_function(board_pieces, board_occupancy, side_to_move):
     mg_black += (pawn_score_black * 6) // 10
     eg_white += pawn_score_white
     eg_black += pawn_score_black            
-                
+    
+    
+    
+    safety_white = evaluate_king_safety(board_pieces, board_occupancy, WHITE, game_phase)
+    safety_black = evaluate_king_safety(board_pieces, board_occupancy, BLACK, game_phase)
+    
+    # Only 50% weight in midgame (reduced from 100%)
+    mg_white += safety_white // 2
+    mg_black += safety_black // 2
+    # Minimal weight in endgame
+    eg_white += safety_white // 5
+    eg_black += safety_black // 5
+
+    
                 
     # Tapered eval
     #calculates the midgame and endgame score if the current turn is white
